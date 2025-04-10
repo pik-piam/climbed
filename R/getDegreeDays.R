@@ -52,9 +52,19 @@
 #' @param globalPars Logical. Indicates whether to use global or gridded BAIT parameters
 #' (required if \code{bait} is TRUE).
 #'
+#' @param endOfHistory An integer specifying the upper temporal limit for historical data.
+#' Defaults to 2025.
+#'
+#' @param noCC \code{logical} indicating whether to compute a no-climate-change scenario.
+#'        If \code{TRUE}, the function will calculate degree days assuming constant climate conditions.
+#'        Default is \code{FALSE}.
+#'
+#' @param packagePath (Optional) A string specifying the path to the package for development mode.
+#' If provided, the SLURM jobs will use devtools::load_all() instead of library() to load the package.
+#'
 #' @author Hagen Tockhorn
 #'
-#' @importFrom dplyr filter pull
+#' @importFrom dplyr filter pull anti_join
 #' @importFrom magrittr %>%
 #' @importFrom utils read.csv
 #' @importFrom stats setNames
@@ -70,7 +80,11 @@ getDegreeDays <- function(mappingFile = NULL,
                           ssp  = c("historical", "SSP2"),
                           outDir = "output",
                           fileRev = NULL,
-                          globalPars = FALSE) {
+                          globalPars = TRUE,
+                          endOfHistory = 2025,
+                          noCC = FALSE,
+                          packagePath = NULL) {
+
   # CHECKS ---------------------------------------------------------------------
 
   # check for mapping file
@@ -107,6 +121,10 @@ getDegreeDays <- function(mappingFile = NULL,
   allJobs <- list()
 
 
+  # indicate whether SSP2 was added for historical fill-up
+  sspAddedForFillup <- FALSE
+
+
 
   # READ-IN DATA ---------------------------------------------------------------
 
@@ -135,12 +153,15 @@ getDegreeDays <- function(mappingFile = NULL,
 
   # CHECKS ---------------------------------------------------------------------
 
-  # check if mapping file contains correct columns
-  mappingCols <- c("gcm", "rcp", "start", "end", "tas", "rsds", "sfcwind", "huss")
-  missingCols <- setdiff(mappingCols, colnames(fileMapping)) # Identify missing columns
-  if (length(missingCols) > 0) { # Check if there are any missing columns
-    stop("Please provide file mapping with correct columns.\nMissing columns:\n",
-         paste(missingCols, collapse = ", "))
+  if (!is.null(fileMapping)) {
+    # check if mapping file contains correct columns
+    mappingCols <- c("gcm", "rcp", "start", "end", "tas", "rsds", "sfcwind", "huss")
+    missingCols <- setdiff(mappingCols, colnames(fileMapping)) # Identify missing columns
+
+    if (length(missingCols) > 0) { # Check if there are any missing columns
+      stop("Please provide file mapping with correct columns.\nMissing columns:\n",
+           paste(missingCols, collapse = ", "))
+    }
   }
 
   # create output directory if it doesn't exist
@@ -176,6 +197,47 @@ getDegreeDays <- function(mappingFile = NULL,
     lapply(trimws)
 
 
+  # if no file mapping is given for noCC-case, use default
+  if (is.null(fileMapping) && isTRUE(noCC)) {
+    fileMapping <- read.csv2(getSystemFile("extdata", "mappings", "ISIMIPbuildings_fileMapping.csv",
+                                           package = "climbed")) %>%
+      filter(.data$rcp == "historical")
+  }
+
+
+  # indicate original mapping entries
+  fileMapping <- fileMapping %>%
+    mutate(originalFile = TRUE)
+
+  # if necessary, add files to fill up missing historical data points
+  if (max(fileMapping$end[fileMapping$rcp == "historical"]) < endOfHistory &&
+        !(any(fileMapping$rcp == "2.6" &
+                fileMapping$start <= max(fileMapping$end[fileMapping$rcp == "historical"]) + 1 &
+                fileMapping$end >= endOfHistory) &&
+            length(unique(fileMapping$gcm[fileMapping$rcp == "2.6"])) == 5)) {
+
+    fullMappingFile <- getSystemFile("extdata", "mappings", "ISIMIPbuildings_fileMapping.csv",
+                                     package = "climbed")
+    fileMapping <- fullMappingFile %>%
+      read.csv2() %>%
+      # ensure the files cover the period from the end of historical data to endOfHistory
+      filter(.data$rcp == "2.6",
+             (.data$start <= max(fileMapping$end[fileMapping$rcp == "historical"]) + 1 &
+                .data$end >= endOfHistory)) %>%
+      # filter out duplicated entries
+      anti_join(fileMapping, by = c("gcm", "rcp", "start", "end")) %>%
+      mutate(originalFile = FALSE) %>%
+      rbind(fileMapping)
+
+    # If we added fill-up files and SSP2 is not in the original list, add it now
+    if (nrow(fileMapping[fileMapping$originalFile == FALSE, ]) > 0 &&
+          !("SSP2" %in% ssp)) {
+      ssp <- c(ssp, "ssp2")
+      sspAddedForFillup <- TRUE
+    }
+  }
+
+
   # calculate HDD/CDD-factors
   hddcddFactor <- compFactors(tLow = tLow, tUp = tUp, tLim, std[["tAmb"]], std[["tLim"]])
 
@@ -194,9 +256,14 @@ getDegreeDays <- function(mappingFile = NULL,
     # read in population data
     pop <- importData(subtype = popMapping[[s]])
 
-    # filter compatible RCP scenarios
-    files <- fileMapping %>%
-      filter(.data[["rcp"]] %in% scenMatrix[[s]])
+    # filter compatible RCP scenarios and ensure that added SSPs are only used for fill-up
+    if (s == "ssp2" && isTRUE(sspAddedForFillup)) {
+      files <- fileMapping %>%
+        filter(!.data$originalFile)
+    } else {
+      files <- fileMapping %>%
+        filter(.data[["rcp"]] %in% scenMatrix[[s]])
+    }
 
     if (nrow(files) == 0) {
       stop("Provided SSP scenario not in file mapping.")
@@ -217,9 +284,11 @@ getDegreeDays <- function(mappingFile = NULL,
                              hddcddFactor = hddcddFactor,
                              wBAIT = wBAIT,
                              outDir = outDir,
-                             globalPars = globalPars)
+                             globalPars = globalPars,
+                             noCC = noCC,
+                             packagePath = packagePath)
 
-          allJobs <- c(allJobs, job)
+          allJobs[[job$jobId]] <- job
           message("Job ", job$jobId, " submitted successfully")
         },
         error = function(e) {
@@ -229,6 +298,7 @@ getDegreeDays <- function(mappingFile = NULL,
     }
   }
 
+
   if (length(allJobs) == 0) {
     stop("No jobs were successfully submitted")
   }
@@ -237,7 +307,7 @@ getDegreeDays <- function(mappingFile = NULL,
   message("Waiting for jobs to complete...")
 
   # extract all job IDs
-  jobIds <- lapply(allJobs, function(x) x$jobId)
+  jobIds <- as.numeric(names(allJobs))
 
   # wait for our specific jobs to complete (max. 6hrs)
   waitForSlurm(jobIds, maxWaitTime = 6 * 60 * 60)
@@ -249,8 +319,32 @@ getDegreeDays <- function(mappingFile = NULL,
   # gather outputs from slurm jobs
   data <- gatherData(fileMapping = fileMapping, outDir = outDir)
 
+
+  # if specified, calculate degree days for constant climate
+  if (isTRUE(noCC)) {
+    # extract directory for grid data
+    gridDataDir <- lapply(allJobs, function(x) x$gridDataDir) %>%
+      unique() %>%
+      unlist()
+
+    dataNoCC <- computeConstantClimate(fileMapping = fileMapping,
+                                       ssp = ssp,
+                                       popMapping = popMapping,
+                                       nHistYears = 5,
+                                       gridDataDir = gridDataDir)
+
+    data <- rbind(data, dataNoCC)
+  }
+
+
   # smooth degree days
-  dataSmooth <- smoothDegreeDays(data, nSmoothIter = 50, transitionYears = 5)
+  dataSmooth <- smoothDegreeDays(data,
+                                 fileMapping,
+                                 nSmoothIter = 100,
+                                 transitionYears = 10,
+                                 endOfHistory = endOfHistory,
+                                 noCC = noCC,
+                                 predictTransition = FALSE)
 
 
 
