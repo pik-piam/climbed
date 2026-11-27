@@ -12,3 +12,8 @@
 ^.*CITATION.cff$
 ^inst/intdata/
 ^output$
+^\.claude$
+^_pkgdown\.yml$
+^CODE_STYLE\.md$
+^CLAUDE.md$
+^AGENTS.md$
